@@ -4,6 +4,7 @@ from typing import List, Dict, Any
 
 import pandas as pd
 import streamlit as st
+import requests
 
 from vocab_test import generate_mcq_questions
 
@@ -12,6 +13,65 @@ st.set_page_config(page_title="Year 5 Vocabulary Practice", page_icon="📚", la
 
 # 本地 CSV 路径（你可以按需要改名）
 CSV_PATH = "word_list.csv"
+
+
+# -------------------------
+# 词典查询相关函数（新加）
+# -------------------------
+def fetch_meaning_for_word(word: str) -> str:
+    """
+    根据单词从在线字典 API 拉一个简短释义。
+    使用 https://api.dictionaryapi.dev/ 这个公开接口。
+    出错或查不到时返回空字符串。
+    """
+    try:
+        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code != 200:
+            return ""
+        data = resp.json()
+        # 取第一个释义：data[0]["meanings"][0]["definitions"][0]["definition"]
+        if not isinstance(data, list) or not data:
+            return ""
+        first = data[0]
+        meanings = first.get("meanings", [])
+        if not meanings:
+            return ""
+        defs = meanings[0].get("definitions", [])
+        if not defs:
+            return ""
+        definition = defs[0].get("definition", "")
+        return definition.strip()
+    except Exception:
+        return ""
+
+
+def ensure_meanings(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    确保 DataFrame 有 'meaning' 列：
+    - 如果没有 'meaning' 列：新建一列为空
+    - 然后对每一行，如果 meaning 为空/缺失，就用 fetch_meaning_for_word(word) 补上。
+
+    注意：这里假设第一列是单词列，列名为 'word'。
+    """
+    if "word" not in df.columns:
+        # 如果文件没有列名，可能第一列就是单词，这里给它命名
+        # 比如原始 CSV 没有 header，可以在读入时设 header=None 并在这里改名
+        raise ValueError("CSV 必须至少有一列为单词列，且列名为 'word'。")
+
+    # 如果没有 meaning 列，就创建一列空字符串
+    if "meaning" not in df.columns:
+        df["meaning"] = ""
+
+    # 对 meaning 为空的，根据 word 去查 definition
+    for idx, row in df.iterrows():
+        word = str(row["word"]).strip()
+        meaning = row["meaning"]
+        if not isinstance(meaning, str) or not meaning.strip():
+            if word:
+                df.at[idx, "meaning"] = fetch_meaning_for_word(word)
+
+    return df
 
 
 # -------------------------
@@ -42,18 +102,27 @@ def init_session_state():
 
 
 def load_local_csv():
-    """从本地 CSV 读取 word_list."""
+    """从本地 CSV 读取 word_list，然后根据第一列单词补全/修正释义。"""
     try:
         df = pd.read_csv(CSV_PATH)
     except Exception as e:
         st.error(f"读取本地文件 `{CSV_PATH}` 失败：{e}")
         return None
 
-    if "word" not in df.columns or "meaning" not in df.columns:
-        st.error(f"CSV 必须包含列：'word' 和 'meaning'。当前列为：{list(df.columns)}")
+    # 如果没有 'word' 列，但只有一列，可能是没有 header 的情况，可以在这里处理：
+    # 比如：
+    # if "word" not in df.columns and df.shape[1] == 1:
+    #     df.columns = ["word"]
+
+    # 先确保有 word 列，再自动填 meaning
+    try:
+        df = ensure_meanings(df)
+    except Exception as e:
+        st.error(f\"处理单词与释义时出错：{e}\")
         return None
 
-    return df.dropna(subset=["word", "meaning"]).reset_index(drop=True)
+    # 最后只保留 word / meaning 两列（保证干净）
+    return df[["word", "meaning"]].dropna(subset=["word"]).reset_index(drop=True)
 
 
 def pick_random_word():
@@ -125,7 +194,7 @@ def main():
     init_session_state()
 
     st.title("📚 Year 5 Vocabulary Practice")
-    st.write("直接从本地 `word_list.csv` 读取单词（包含列 `word`, `meaning`）。")
+    st.write("直接从本地 `word_list.csv` 读取**单词**，并自动根据单词补全/修正释义。")
 
     # 读取本地 CSV，只读一次
     if st.session_state.df is None:
@@ -235,7 +304,6 @@ def main():
                     f"**总分：{correct_count} / {total}**  （正确率：{correct_count/total*100:.1f}%）"
                 )
 
-                # 方便你重新记这批错误题
                 wrong_words = [
                     q["word"]
                     for i, q in enumerate(questions)
