@@ -118,11 +118,13 @@ def load_local_csv():
     try:
         df = ensure_meanings(df)
     except Exception as e:
-        st.error(f\"处理单词与释义时出错：{e}\")
+        # 这一行改成下面这样就不会报 SyntaxError 了
+        st.error(f"处理单词与释义时出错：{e}")
         return None
 
     # 最后只保留 word / meaning 两列（保证干净）
     return df[["word", "meaning"]].dropna(subset=["word"]).reset_index(drop=True)
+
 
 
 def pick_random_word():
