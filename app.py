@@ -5,32 +5,40 @@ from typing import List, Dict, Any
 import pandas as pd
 import streamlit as st
 import requests
+from googletrans import Translator
 
 from vocab_test import generate_mcq_questions
 
+st.set_page_config(
+    page_title="Year 5 Vocabulary Practice",
+    page_icon="📚",
+    layout="wide",
+)
 
-st.set_page_config(page_title="Year 5 Vocabulary Practice", page_icon="📚", layout="wide")
-
-# 本地 CSV 路径（你可以按需要改名）
+# 本地 CSV 路径：第一列单词，第二列可以是原始释义（可有可无）
 CSV_PATH = "word_list.csv"
+
+# 全局翻译器
+translator = Translator()
 
 
 # -------------------------
-# 词典查询相关函数（新加）
+# 词典 & 翻译函数
 # -------------------------
 def fetch_meaning_for_word(word: str) -> str:
     """
-    根据单词从在线字典 API 拉一个简短释义。
+    根据单词从在线字典 API 拉一个简短英文释义。
     使用 https://api.dictionaryapi.dev/ 这个公开接口。
     出错或查不到时返回空字符串。
     """
+    if not word:
+        return ""
     try:
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
         resp = requests.get(url, timeout=5)
         if resp.status_code != 200:
             return ""
         data = resp.json()
-        # 取第一个释义：data[0]["meanings"][0]["definitions"][0]["definition"]
         if not isinstance(data, list) or not data:
             return ""
         first = data[0]
@@ -46,36 +54,72 @@ def fetch_meaning_for_word(word: str) -> str:
         return ""
 
 
+def translate_to_zh(text: str) -> str:
+    """
+    把英文释义翻译成中文。
+    失败时返回空字符串，不抛异常。
+    """
+    if not text:
+        return ""
+    try:
+        result = translator.translate(text, dest="zh-cn")
+        return result.text.strip()
+    except Exception:
+        return ""
+
+
 def ensure_meanings(df: pd.DataFrame) -> pd.DataFrame:
     """
-    确保 DataFrame 有 'meaning' 列：
-    - 如果没有 'meaning' 列：新建一列为空
-    - 然后对每一行，如果 meaning 为空/缺失，就用 fetch_meaning_for_word(word) 补上。
+    对所有行都做一次更新：
+    - 无论原 meaning 有没有值，都尝试按 word 重新查一次英文释义 new_en；
+    - 如果 new_en 为空，则用原来的 old_meaning 兜底；
+    - 在 final_en 的基础上翻译成中文 zh；
+    - 最终 meaning 列为: "final_en（zh）"，若 zh 为空则只有 final_en。
 
-    注意：这里假设第一列是单词列，列名为 'word'。
+    这样可以：
+    - 尽量修正 PDF 提取导致的不完整释义；
+    - 查不到的词又不会丢掉你原来写在 CSV 里的内容。
     """
     if "word" not in df.columns:
-        # 如果文件没有列名，可能第一列就是单词，这里给它命名
-        # 比如原始 CSV 没有 header，可以在读入时设 header=None 并在这里改名
         raise ValueError("CSV 必须至少有一列为单词列，且列名为 'word'。")
 
-    # 如果没有 meaning 列，就创建一列空字符串
+    # 如果没有 meaning 列，就先创建
     if "meaning" not in df.columns:
         df["meaning"] = ""
 
-    # 对 meaning 为空的，根据 word 去查 definition
-    for idx, row in df.iterrows():
-        word = str(row["word"]).strip()
-        meaning = row["meaning"]
-        if not isinstance(meaning, str) or not meaning.strip():
-            if word:
-                df.at[idx, "meaning"] = fetch_meaning_for_word(word)
+    new_meanings: List[str] = []
 
+    for _, row in df.iterrows():
+        word = str(row["word"]).strip()
+
+        old_meaning = row["meaning"]
+        if pd.isna(old_meaning):
+            old_meaning = ""
+        old_meaning = str(old_meaning).strip()
+
+        # 1. 尝试查新的英文释义
+        new_en = fetch_meaning_for_word(word)
+
+        # 2. 查不到就用原来的
+        final_en = new_en if new_en else old_meaning
+
+        # 3. 翻译成中文
+        zh = translate_to_zh(final_en) if final_en else ""
+
+        # 4. 组合
+        if final_en and zh:
+            combined = f"{final_en}（{zh}）"
+        else:
+            combined = final_en
+
+        new_meanings.append(combined)
+
+    df["meaning"] = new_meanings
     return df
 
 
 # -------------------------
-# 辅助函数：初始化 session_state
+# Session state 初始化
 # -------------------------
 def init_session_state():
     if "df" not in st.session_state:
@@ -97,44 +141,59 @@ def init_session_state():
         st.session_state.study_df = None  # 本次要考的那批单词（带释义）
 
     if "phase" not in st.session_state:
-        # phase: "idle" | "study" | "test"
+        # "idle" | "study" | "test"
         st.session_state.phase = "idle"
 
 
+# -------------------------
+# 读本地 CSV
+# -------------------------
 def load_local_csv():
-    """从本地 CSV 读取 word_list，然后根据第一列单词补全/修正释义。"""
+    """
+    从本地 CSV 读取：
+    - 把第一列当作单词列，列名改成 'word'；
+    - 第二列若存在，当作原始 meaning 兜底；
+    - 然后调用 ensure_meanings 统一更新+加中文。
+    """
     try:
         df = pd.read_csv(CSV_PATH)
     except Exception as e:
         st.error(f"读取本地文件 `{CSV_PATH}` 失败：{e}")
         return None
 
-    # 如果没有 'word' 列，但只有一列，可能是没有 header 的情况，可以在这里处理：
-    # 比如：
-    # if "word" not in df.columns and df.shape[1] == 1:
-    #     df.columns = ["word"]
+    # 如果没有 'word' 列，则自动把第一列命名为 'word'
+    if "word" not in df.columns:
+        # 把第一列重命名为 word
+        first_col = df.columns[0]
+        df = df.rename(columns={first_col: "word"})
 
-    # 先确保有 word 列，再自动填 meaning
+    # 若 meaning 列不存在而且有第二列，就把第二列当作 meaning
+    if "meaning" not in df.columns and df.shape[1] >= 2:
+        second_col = df.columns[1]
+        df = df.rename(columns={second_col: "meaning"})
+
     try:
         df = ensure_meanings(df)
     except Exception as e:
-        # 这一行改成下面这样就不会报 SyntaxError 了
         st.error(f"处理单词与释义时出错：{e}")
         return None
 
-    # 最后只保留 word / meaning 两列（保证干净）
     return df[["word", "meaning"]].dropna(subset=["word"]).reset_index(drop=True)
 
 
-
+# -------------------------
+# 随机单词学习
+# -------------------------
 def pick_random_word():
-    """左侧：随机选一个单词展示。"""
     df = st.session_state.df
     if df is None or df.empty:
         return
     st.session_state.current_idx = random.randint(0, len(df) - 1)
 
 
+# -------------------------
+# Test 流程
+# -------------------------
 def prepare_study_list(num_questions: int):
     """
     抽取一批单词供记忆，并显示 word + meaning。
@@ -148,7 +207,6 @@ def prepare_study_list(num_questions: int):
     n = min(num_questions, len(df))
     st.session_state.study_df = df.sample(n=n, replace=False).reset_index(drop=True)
 
-    # 进入“记忆阶段”
     st.session_state.phase = "study"
     st.session_state.questions = None
     st.session_state.show_result = False
@@ -177,7 +235,7 @@ def start_test_from_study():
         questions = generate_mcq_questions(
             df_full,
             n_options=4,
-            words=words,        # 只考这批单词
+            words=words,
         )
     except Exception as e:
         st.error(f"生成测试题失败: {e}")
@@ -196,7 +254,11 @@ def main():
     init_session_state()
 
     st.title("📚 Year 5 Vocabulary Practice")
-    st.write("直接从本地 `word_list.csv` 读取**单词**，并自动根据单词补全/修正释义。")
+    st.write(
+        "从本地 `word_list.csv` 读取单词："
+        "第一列作为单词，第二列（如果有）作为原始释义。"
+        "程序会自动按单词更新英文释义，并附上中文解释。"
+    )
 
     # 读取本地 CSV，只读一次
     if st.session_state.df is None:
@@ -209,12 +271,9 @@ def main():
 
     df = st.session_state.df
 
-    # 布局：左随机单词 + 右测试模块
     col1, col2 = st.columns([1, 2])
 
-    # -------------------------
     # 左侧：随机单词学习
-    # -------------------------
     with col1:
         st.subheader("🔍 随机单词学习")
 
@@ -229,9 +288,7 @@ def main():
             st.markdown(f"### 单词：**{row['word']}**")
             st.markdown(f"**释义：** {row['meaning']}")
 
-    # -------------------------
-    # 右侧：Test 模块
-    # -------------------------
+    # 右侧：Test 模式
     with col2:
         st.subheader("📝 Test 模式（先看单词，再做题）")
 
@@ -243,11 +300,10 @@ def main():
             step=1,
         )
 
-        # 第一步：抽取并显示单词+释义
         if st.button("抽取并显示这批单词"):
             prepare_study_list(int(num_questions))
 
-        # 记忆阶段：显示这批单词和释义
+        # 记忆阶段：显示 word + meaning 列表
         if st.session_state.phase == "study" and st.session_state.study_df is not None:
             study_df = st.session_state.study_df
             st.markdown("### 请先记忆这些单词（显示 word + meaning）")
@@ -259,12 +315,12 @@ def main():
             if st.button("开始 Test（隐藏上面列表）"):
                 start_test_from_study()
 
-        # 测试阶段：只显示选择题，不再显示原始释义
+        # Test 阶段：只给选择题，不再显示原释义
         questions: List[Dict[str, Any]] = st.session_state.questions
 
         if st.session_state.phase == "test" and questions:
-            st.markdown("### 选择题 Test（不再显示原始释义）")
-            st.markdown("为每个单词选择正确的释义。")
+            st.markdown("### 选择题 Test")
+            st.markdown("为每个单词选择正确的释义（英文 + 中文）。")
 
             for i, q in enumerate(questions):
                 st.markdown(f"**Q{i+1}. {q['word']}**")
@@ -303,7 +359,8 @@ def main():
                         )
 
                 st.markdown(
-                    f"**总分：{correct_count} / {total}**  （正确率：{correct_count/total*100:.1f}%）"
+                    f"**总分：{correct_count} / {total}**  "
+                    f"（正确率：{correct_count/total*100:.1f}%）"
                 )
 
                 wrong_words = [
